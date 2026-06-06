@@ -1,0 +1,21 @@
+# Datasets
+
+KolektorSDD2
+KolektorSDD-boxes
+
+# Virtual environments
+
+venv
+
+# Output files
+
+ksdd1_aug_cache
+ksdd1_segformer_aug_cache
+ksdd2_aug_cache
+ksdd1_aug_cache.zip
+ksdd1_segformer_aug_cache.zip
+ksdd2_aug_cache.zip
+
+# MacOS directories files
+
+.DS_Store
