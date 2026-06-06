@@ -27,7 +27,7 @@ Local datasets, generated caches, cache zip files, virtual environments, and mac
 ## What Each File Does
 
 `KolektorSDD2_ResNet18_UNet.ipynb`
-: ResNet18 encoder with a UNet decoder for KolektorSDD2. Available strategies are `full_ft`, `decoder_only`, `convlora_decoder`, `staged`, and `ssf_decoder`, `last_block_decoder`.
+: ResNet18 encoder with a UNet decoder for KolektorSDD2. Available strategies are `full_ft`, `decoder_only`, `convlora_decoder`, `staged`, `ssf_decoder`and `last_block_decoder`.
 
 `KolektorSDD2_SegformerB0.ipynb`
 : SegFormer-B0 for KolektorSDD2. Available strategies are `full_ft`, `decoder_only`, `lora`, `adaptformer`, and `ssf`.
