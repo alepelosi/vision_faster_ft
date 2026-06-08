@@ -18,6 +18,7 @@ The notebooks are designed for Google Colab with a CUDA GPU. Local scripts are i
 |-- aug_cache/
 |   |-- build_ksdd2_aug_cache.py
 |   `-- build_ksdd1_aug_cache.py
+|-- build_ksdd1_cache_pool.py
 |-- requirements.txt
 `-- .gitignore
 ```
@@ -44,11 +45,11 @@ Local datasets, generated caches, cache zip files, virtual environments, and mac
 `SideTuning/KolektorSDD1_SegformerB0_SideTuning.ipynb`
 : SegFormer-B0 side-tuning on KolektorSDD1 to simulate the same domain shift experiment.
 
-`aug_cache/build_ksdd2_aug_cache.py`
+`build_ksdd2_aug_cache.py`
 : Precomputes augmented KolektorSDD2 training samples into a manifest-backed cache compatible with the SDD2 notebooks.
 
-`aug_cache/build_ksdd1_aug_cache.py`
-: Precomputes augmented KolektorSDD1 training samples into cache folders compatible with the SDD1 side-tuning notebooks.
+`build_ksdd1_cache_pool.py`
+: Standalone script for the KSDD1 side-tuning cache-pool experiments. Use `--resnet` or `--segformer` to build the matching cache. It builds 24 pre-augmented copies per source image locally and records 2 copies per epoch as the intended runtime draw size.
 
 `requirements.txt`
 : Minimal local dependencies for the augmentation cache scripts.
@@ -108,10 +109,11 @@ ksdd2_aug_cache/
 ksdd2_aug_cache.zip
 ```
 
-Build the KolektorSDD1 caches:
+Build the KolektorSDD1 ResNet cache pool:
 
 ```bash
-python aug_cache/build_ksdd1_aug_cache.py \
+python build_ksdd1_cache_pool.py \
+  --resnet \
   --data-root ./KolektorSDD-boxes \
   --force
 ```
@@ -121,8 +123,30 @@ This creates:
 ```text
 ksdd1_aug_cache/
 ksdd1_aug_cache.zip
+```
+
+Build the KolektorSDD1 SegFormer cache pool:
+
+```bash
+python build_ksdd1_cache_pool.py \
+  --segformer \
+  --data-root ./KolektorSDD-boxes \
+  --force
+```
+
+This creates:
+
+```text
 ksdd1_segformer_aug_cache/
 ksdd1_segformer_aug_cache.zip
+```
+
+Use these cache-pool settings in the SDD1 side-tuning notebooks:
+
+```python
+USE_PREPROCESSED_TRAIN = True
+AUGMENTED_COPIES_PER_SAMPLE = 24
+CACHE_COPIES_PER_EPOCH = 2
 ```
 
 Upload the zip files to Google Drive and unzip them in Colab so the folders exist at:
@@ -272,10 +296,10 @@ The training checkpoint is also saved by each notebook, usually with a name cont
 
 ## KolektorSDD1 Domain-Shift Notes
 
-The SDD1 side-tuning notebooks use the older KolektorSDD preprocessing:
+The SDD1 side-tuning notebooks use the older KolektorSDD preprocessing. The target image size is 512 x 1408 pixels in width x height notation. Because TorchVision resize expects height x width, the code uses:
 
 ```text
-IMG_SIZE = (512, 1408)
+IMG_SIZE = (1408, 512)
 ```
 
 They resize images and masks before augmentation, convert grayscale strips to RGB with PIL, estimate the foreground prior from SDD1 masks, use lower minimum-area thresholds for thin cracks, and keep the newer augmentation setup:

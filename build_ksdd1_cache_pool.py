@@ -5,123 +5,180 @@ import json
 import random
 import shutil
 import time
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+
+try:
+    import numpy as np
+    import torch
+    import torchvision.transforms.functional as TF
+    from PIL import Image
+    from torchvision.transforms import ElasticTransform, InterpolationMode
+    from tqdm import tqdm
+except ModuleNotFoundError as exc:
+    np = None
+    torch = None
+    TF = None
+    Image = None
+    ElasticTransform = None
+    InterpolationMode = None
+    tqdm = None
+    IMPORT_ERROR = exc
+else:
+    IMPORT_ERROR = None
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 MASK_EXTS = [".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff"]
 
-DEFAULT_RESNET_CACHE_NAME = "ksdd1_aug_cache"
-DEFAULT_SEGFORMER_CACHE_NAME = "ksdd1_segformer_aug_cache"
-DEFAULT_IMAGE_SIZE = (512, 1408)
+DEFAULT_DATA_ROOT = Path("KolektorSDD-boxes")
+DEFAULT_RESNET_OUTPUT_ROOT = Path("ksdd1_aug_cache")
+DEFAULT_SEGFORMER_OUTPUT_ROOT = Path("ksdd1_segformer_aug_cache")
+DEFAULT_RESNET_MANIFEST_CACHE_ROOT = "/content/ksdd1_aug_cache"
+DEFAULT_SEGFORMER_MANIFEST_CACHE_ROOT = "/content/ksdd1_segformer_aug_cache"
+DEFAULT_IMAGE_SIZE = (1408, 512)
+
+DEFAULT_COPIES = 24
+DEFAULT_COPIES_PER_EPOCH = 2
+DEFAULT_ELASTIC_PROB = 0.3
+DEFAULT_ELASTIC_ALPHA = 25.0
+DEFAULT_ELASTIC_SIGMA = 5.0
+DEFAULT_GAUSSIAN_NOISE_PROB = 0.2
+DEFAULT_GAUSSIAN_NOISE_STD = 0.01
 
 
-@dataclass(frozen=True)
-class CacheTarget:
-    name: str
-    output_root: Path
-    manifest_cache_root: str
-
-
-def load_runtime_deps() -> None:
-    global np, torch, TF, Image, ElasticTransform, InterpolationMode, tqdm
-
-    try:
-        import numpy as np
-        import torch
-        import torchvision.transforms.functional as TF
-        from PIL import Image
-        from torchvision.transforms import ElasticTransform, InterpolationMode
-        from tqdm import tqdm
-    except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "Missing dependency while building the cache. Install the augmentation "
-            "requirements first, for example: pip install torch torchvision pillow numpy tqdm"
-        ) from exc
+def require_runtime_deps() -> None:
+    if IMPORT_ERROR is None:
+        return
+    raise SystemExit(
+        "Missing dependency while building the cache. Install the local "
+        "requirements first, for example: pip install -r requirements.txt"
+    ) from IMPORT_ERROR
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create preprocessed augmentation cache(s) for KolektorSDD1."
+        description=(
+            "Build a large pre-augmented KolektorSDD1 cache pool locally. "
+            "The generated cache is compatible with the SDD1 side-tuning "
+            "notebooks."
+        )
+    )
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument(
+        "--resnet",
+        action="store_true",
+        help="Build the cache expected by the ResNet18-UNet SDD1 side-tuning notebook.",
+    )
+    model_group.add_argument(
+        "--segformer",
+        action="store_true",
+        help="Build the cache expected by the SegFormer-B0 SDD1 side-tuning notebook.",
     )
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("KolektorSDD-boxes"),
-        help="Local KolektorSDD1 folder containing kosXX folders.",
-    )
-    parser.add_argument(
-        "--cache-kind",
-        choices=("resnet", "segformer", "both"),
-        default="both",
-        help="Which notebook cache format/path to create.",
+        default=DEFAULT_DATA_ROOT,
+        help="Local KolektorSDD1 folder containing kosXX folders, or train/test.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
         default=None,
-        help=(
-            "Override output folder when --cache-kind is resnet or segformer. "
-            "Ignored for --cache-kind both."
-        ),
-    )
-    parser.add_argument(
-        "--resnet-output-root",
-        type=Path,
-        default=Path(DEFAULT_RESNET_CACHE_NAME),
-        help="Local folder for the ResNet side-tuning cache.",
-    )
-    parser.add_argument(
-        "--segformer-output-root",
-        type=Path,
-        default=Path(DEFAULT_SEGFORMER_CACHE_NAME),
-        help="Local folder for the SegFormer side-tuning cache.",
+        help="Local folder to write the cache into. Defaults depend on --resnet/--segformer.",
     )
     parser.add_argument(
         "--manifest-cache-root",
         default=None,
         help=(
-            "Override manifest cache root when --cache-kind is resnet or segformer. "
-            "Use the final Colab path, for example /content/ksdd1_aug_cache."
+            "Path the cache folder will have in Colab after unzip. The manifest "
+            "uses this path for image/mask entries. Defaults depend on --resnet/--segformer."
         ),
     )
     parser.add_argument(
-        "--resnet-manifest-cache-root",
-        default="/content/ksdd1_aug_cache",
-        help="Path the ResNet cache will have in Colab.",
+        "--copies",
+        type=int,
+        default=DEFAULT_COPIES,
+        help="Total cached augmented copies to precompute per source image.",
     )
     parser.add_argument(
-        "--segformer-manifest-cache-root",
-        default="/content/ksdd1_segformer_aug_cache",
-        help="Path the SegFormer cache will have in Colab.",
+        "--cache-copies-per-epoch",
+        type=int,
+        default=DEFAULT_COPIES_PER_EPOCH,
+        help=(
+            "Recommended number of cached copies to draw per source image each "
+            "epoch in the notebook. This is metadata only and does not affect "
+            "the cache validity check."
+        ),
     )
-    parser.add_argument("--copies", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-fraction", type=float, default=0.20)
-    parser.add_argument("--image-size", type=int, nargs=2, default=DEFAULT_IMAGE_SIZE, metavar=("HEIGHT", "WIDTH"))
-    parser.add_argument("--elastic-prob", type=float, default=0.6)
-    parser.add_argument("--elastic-alpha", type=float, default=45.0)
-    parser.add_argument("--elastic-sigma", type=float, default=5.0)
-    parser.add_argument("--gaussian-noise-prob", type=float, default=0.3)
-    parser.add_argument("--gaussian-noise-std", type=float, default=0.02)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        nargs=2,
+        default=DEFAULT_IMAGE_SIZE,
+        metavar=("HEIGHT", "WIDTH"),
+        help="Resize target in TorchVision order: HEIGHT WIDTH.",
+    )
+    parser.add_argument("--elastic-prob", type=float, default=DEFAULT_ELASTIC_PROB)
+    parser.add_argument("--elastic-alpha", type=float, default=DEFAULT_ELASTIC_ALPHA)
+    parser.add_argument("--elastic-sigma", type=float, default=DEFAULT_ELASTIC_SIGMA)
+    parser.add_argument("--gaussian-noise-prob", type=float, default=DEFAULT_GAUSSIAN_NOISE_PROB)
+    parser.add_argument("--gaussian-noise-std", type=float, default=DEFAULT_GAUSSIAN_NOISE_STD)
     parser.add_argument("--compress-level", type=int, default=1)
-    parser.add_argument("--force", action="store_true", help="Overwrite existing cache folder(s).")
+    parser.add_argument("--force", action="store_true", help="Overwrite output-root if it exists.")
     zip_group = parser.add_mutually_exclusive_group()
     zip_group.add_argument(
         "--zip",
         dest="zip",
         action="store_true",
-        help="Create .zip archive(s). This is enabled by default.",
+        help="Create output-root.zip. This is enabled by default.",
     )
     zip_group.add_argument(
         "--no-zip",
         dest="zip",
         action="store_false",
-        help="Only create cache folder(s), without zip archive(s).",
+        help="Only create the cache folder and skip the zip archive.",
     )
     parser.set_defaults(zip=True)
     return parser.parse_args()
+
+
+def apply_model_defaults(args: argparse.Namespace) -> None:
+    if args.segformer:
+        args.model_cache = "segformer"
+        default_output_root = DEFAULT_SEGFORMER_OUTPUT_ROOT
+        default_manifest_cache_root = DEFAULT_SEGFORMER_MANIFEST_CACHE_ROOT
+    else:
+        args.model_cache = "resnet"
+        default_output_root = DEFAULT_RESNET_OUTPUT_ROOT
+        default_manifest_cache_root = DEFAULT_RESNET_MANIFEST_CACHE_ROOT
+
+    if args.output_root is None:
+        args.output_root = default_output_root
+    if args.manifest_cache_root is None:
+        args.manifest_cache_root = default_manifest_cache_root
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.copies < 1:
+        raise ValueError("--copies must be at least 1")
+    if args.cache_copies_per_epoch < 1:
+        raise ValueError("--cache-copies-per-epoch must be at least 1")
+    if args.cache_copies_per_epoch > args.copies:
+        raise ValueError("--cache-copies-per-epoch cannot exceed --copies")
+    if args.cache_copies_per_epoch == args.copies:
+        print(
+            "Warning: --cache-copies-per-epoch equals --copies; every epoch will "
+            "see all cached copies, so there is no pool-sampling benefit."
+        )
+    if not 0 <= args.compress_level <= 9:
+        raise ValueError("--compress-level must be in [0, 9]")
+    if not 0 < args.val_fraction < 1:
+        raise ValueError("--val-fraction must be between 0 and 1")
+    if len(args.image_size) != 2:
+        raise ValueError("--image-size expects HEIGHT WIDTH")
 
 
 def is_mask_path(path: Path) -> bool:
@@ -158,7 +215,7 @@ def resolve_data_root(data_root: Path) -> Path:
         root,
         root / "KolektorSDD-boxes",
         root / "KolektorSDD",
-        root / "KolektorSDD2",
+        root / "KolektorSDD1",
     ]
     for candidate in candidates:
         if candidate.exists() and (has_train_test(candidate) or has_sdd1_groups(candidate)):
@@ -168,7 +225,7 @@ def resolve_data_root(data_root: Path) -> Path:
         if candidate.is_dir() and (has_train_test(candidate) or has_sdd1_groups(candidate)):
             return candidate
 
-    raise FileNotFoundError(f"Could not find KolektorSDD1 kosXX folders under: {root}")
+    raise FileNotFoundError(f"Could not find KolektorSDD1 data under: {root}")
 
 
 def find_mask(image_path: Path) -> Path | None:
@@ -192,6 +249,7 @@ def find_mask(image_path: Path) -> Path | None:
 
 
 def mask_has_positive(mask_path: Path | None) -> bool:
+    require_runtime_deps()
     if mask_path is None:
         return False
     with Image.open(mask_path) as mask_img:
@@ -298,15 +356,21 @@ def load_sample_pil(
     sample: dict[str, object],
     image_size: tuple[int, int],
 ) -> tuple[Image.Image, Image.Image]:
+    require_runtime_deps()
     img_path = Path(sample["image"])
     mask_path = sample["mask"]
 
-    img = Image.open(img_path).convert("RGB")
+    with Image.open(img_path) as img_file:
+        img = img_file.convert("RGB")
+
     if mask_path is None:
         mask = Image.new("L", img.size, 0)
     else:
-        mask = Image.open(Path(mask_path)).convert("L")
+        with Image.open(Path(mask_path)) as mask_file:
+            mask = mask_file.convert("L")
         if mask.size != img.size:
+            img.close()
+            mask.close()
             raise ValueError(f"Image/mask size mismatch: image={img_path}, mask={mask_path}")
 
     img = TF.resize(img, image_size, interpolation=InterpolationMode.BILINEAR)
@@ -378,14 +442,14 @@ def colab_cache_path(manifest_cache_root: str, *parts: str) -> str:
 
 def manifest_row(
     sample: dict[str, object],
-    target: CacheTarget,
     image_name: str,
     mask_name: str,
     sample_idx: int,
     copy_idx: int,
+    args: argparse.Namespace,
 ) -> dict[str, object]:
-    image_path = colab_cache_path(target.manifest_cache_root, "train", image_name)
-    mask_path = colab_cache_path(target.manifest_cache_root, "train", mask_name)
+    image_path = colab_cache_path(args.manifest_cache_root, "train", image_name)
+    mask_path = colab_cache_path(args.manifest_cache_root, "train", mask_name)
     sample_id = f"{sample_idx:05d}_aug{copy_idx:02d}"
     label = int(bool(sample["has_crack"]))
 
@@ -417,145 +481,174 @@ def preprocess_cache_config(num_raw_samples: int, args: argparse.Namespace) -> d
     }
 
 
-def build_targets(args: argparse.Namespace) -> list[CacheTarget]:
-    if args.cache_kind == "resnet":
-        output_root = args.output_root or args.resnet_output_root
-        manifest_root = args.manifest_cache_root or args.resnet_manifest_cache_root
-        return [CacheTarget("resnet", output_root, manifest_root)]
-    if args.cache_kind == "segformer":
-        output_root = args.output_root or args.segformer_output_root
-        manifest_root = args.manifest_cache_root or args.segformer_manifest_cache_root
-        return [CacheTarget("segformer", output_root, manifest_root)]
-    return [
-        CacheTarget("resnet", args.resnet_output_root, args.resnet_manifest_cache_root),
-        CacheTarget("segformer", args.segformer_output_root, args.segformer_manifest_cache_root),
-    ]
+def prepare_output_dir(output_root: Path, force: bool) -> tuple[Path, Path]:
+    output_root = output_root.expanduser().resolve()
+    if output_root.exists():
+        if not force:
+            raise FileExistsError(f"{output_root} already exists. Use --force to overwrite it.")
+        shutil.rmtree(output_root)
+
+    tmp_root = output_root.parent / f"{output_root.name}._tmp"
+    if tmp_root.exists():
+        shutil.rmtree(tmp_root)
+    (tmp_root / "train").mkdir(parents=True, exist_ok=True)
+    return output_root, tmp_root
 
 
-def prepare_output_dirs(targets: list[CacheTarget], force: bool) -> None:
-    seen_roots: set[Path] = set()
-    for target in targets:
-        output_root = target.output_root.expanduser().resolve()
-        if output_root in seen_roots:
-            raise ValueError(f"Duplicate output root requested: {output_root}")
-        seen_roots.add(output_root)
-
-        if output_root.exists():
-            if not force:
-                raise FileExistsError(f"{output_root} already exists. Use --force to overwrite it.")
-            shutil.rmtree(output_root)
-        (output_root / "train").mkdir(parents=True, exist_ok=True)
+def finalize_output_dir(tmp_root: Path, output_root: Path) -> Path:
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    tmp_root.rename(output_root)
+    return output_root
 
 
-def save_augmented_arrays(
+def remove_stale_zip(output_root: Path) -> None:
+    zip_path = output_root.parent / f"{output_root.name}.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+
+
+def save_cached_sample(
     img_np: np.ndarray,
     mask_np: np.ndarray,
-    targets: list[CacheTarget],
+    output_root: Path,
     sample: dict[str, object],
     sample_idx: int,
     copy_idx: int,
     args: argparse.Namespace,
-) -> dict[str, list[dict[str, object]]]:
+) -> dict[str, object]:
     stem = f"{sample_idx:05d}_aug{copy_idx:02d}"
     image_name = f"{stem}.png"
     mask_name = f"{stem}_GT.png"
-    rows_by_target: dict[str, list[dict[str, object]]] = {}
 
-    for target in targets:
-        output_root = target.output_root.expanduser().resolve()
-        Image.fromarray(img_np).save(output_root / "train" / image_name, compress_level=args.compress_level)
-        Image.fromarray(mask_np).save(output_root / "train" / mask_name, compress_level=args.compress_level)
-        rows_by_target.setdefault(target.name, []).append(
-            manifest_row(sample, target, image_name, mask_name, sample_idx, copy_idx)
+    Image.fromarray(img_np).save(output_root / "train" / image_name, compress_level=args.compress_level)
+    Image.fromarray(mask_np).save(output_root / "train" / mask_name, compress_level=args.compress_level)
+    return manifest_row(sample, image_name, mask_name, sample_idx, copy_idx, args)
+
+
+def build_augmented_arrays(
+    sample: dict[str, object],
+    sample_idx: int,
+    copy_idx: int,
+    image_size: tuple[int, int],
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        raw_img, raw_mask = load_sample_pil(sample, image_size)
+        img, mask = apply_training_augmentation(raw_img, raw_mask, args)
+        img_t = maybe_add_gaussian_noise(TF.to_tensor(img), args)
+        img_np = (
+            (img_t.permute(1, 2, 0).numpy() * 255.0)
+            .round()
+            .clip(0, 255)
+            .astype(np.uint8)
         )
+        mask_np = (np.array(mask) > 0).astype(np.uint8) * 255
+        return img_np, mask_np
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed while augmenting sample_idx={sample_idx}, copy_idx={copy_idx}, "
+            f"image={sample.get('image')}"
+        ) from exc
 
-    return rows_by_target
+
+def write_manifest(
+    output_root: Path,
+    config: dict[str, object],
+    samples: list[dict[str, object]],
+    elapsed: float,
+    args: argparse.Namespace,
+) -> None:
+    manifest = {
+        "config": config,
+        "samples": samples,
+        "elapsed_seconds": elapsed,
+        "cache_pool": {
+            "copies_per_epoch": int(args.cache_copies_per_epoch),
+            "description": (
+                "Runtime sampling hint only. Keep this out of config so changing "
+                "the per-epoch draw size does not invalidate the precomputed pool."
+            ),
+        },
+    }
+    (output_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def print_notebook_settings(args: argparse.Namespace) -> None:
+    print(f"\nUse these {args.model_cache} notebook settings with this cache pool:")
+    print("USE_PREPROCESSED_TRAIN = True")
+    print(f"AUGMENTED_COPIES_PER_SAMPLE = {args.copies}")
+    print(f"CACHE_COPIES_PER_EPOCH = {args.cache_copies_per_epoch}")
+    print(f'PREPROCESS_CACHE_ROOT = Path("{args.manifest_cache_root}")')
+    print(f'DRIVE_PREPROCESS_CACHE_ZIP = Path("/content/drive/MyDrive/{args.output_root.name}.zip")')
 
 
 def main() -> None:
     args = parse_args()
-    load_runtime_deps()
-
-    if args.copies < 1:
-        raise ValueError("--copies must be at least 1")
-    if not 0 <= args.compress_level <= 9:
-        raise ValueError("--compress-level must be in [0, 9]")
-    if not 0 < args.val_fraction < 1:
-        raise ValueError("--val-fraction must be between 0 and 1")
+    apply_model_defaults(args)
+    require_runtime_deps()
+    validate_args(args)
 
     image_size = (int(args.image_size[0]), int(args.image_size[1]))
     args.image_size = image_size
 
     data_root = resolve_data_root(args.data_root)
-    targets = build_targets(args)
-    prepare_output_dirs(targets, args.force)
-
+    output_root, tmp_root = prepare_output_dir(args.output_root, args.force)
     train_samples = load_train_samples(data_root, args)
     config = preprocess_cache_config(len(train_samples), args)
 
     print(f"Dataset root: {data_root}")
-    print(f"Image size: {image_size}")
-    print(f"Copies per sample: {args.copies}")
-    for target in targets:
-        print(f"{target.name} cache: {target.output_root.expanduser().resolve()}")
-        print(f"{target.name} manifest root: {target.manifest_cache_root}")
+    print(f"Cache target: {args.model_cache}")
+    print(f"Output cache: {output_root}")
+    print(f"Temporary build cache: {tmp_root}")
+    print(f"Manifest cache root: {args.manifest_cache_root}")
+    print(f"Image size: {image_size} (HEIGHT, WIDTH)")
+    print(f"Cached copies per source image: {args.copies}")
+    print(f"Recommended copies drawn per epoch: {args.cache_copies_per_epoch}")
+    print(
+        "Augmentation: "
+        f"elastic_p={args.elastic_prob}, elastic_alpha={args.elastic_alpha}, "
+        f"elastic_sigma={args.elastic_sigma}, noise_p={args.gaussian_noise_prob}, "
+        f"noise_std={args.gaussian_noise_std}"
+    )
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    rows_by_target = {target.name: [] for target in targets}
+    cached_samples: list[dict[str, object]] = []
     start = time.time()
-    for sample_idx, sample in enumerate(tqdm(train_samples, desc="Building KSDD1 cache")):
-        for copy_idx in range(args.copies):
-            img, mask = load_sample_pil(sample, image_size)
-            try:
-                img, mask = apply_training_augmentation(img, mask, args)
-                img_t = maybe_add_gaussian_noise(TF.to_tensor(img), args)
-                img_np = (
-                    (img_t.permute(1, 2, 0).numpy() * 255.0)
-                    .round()
-                    .clip(0, 255)
-                    .astype(np.uint8)
+    try:
+        for sample_idx, sample in enumerate(tqdm(train_samples, desc=f"Building KSDD1 {args.model_cache} cache pool")):
+            for copy_idx in range(args.copies):
+                img_np, mask_np = build_augmented_arrays(sample, sample_idx, copy_idx, image_size, args)
+                cached_samples.append(
+                    save_cached_sample(img_np, mask_np, tmp_root, sample, sample_idx, copy_idx, args)
                 )
-                mask_np = (np.array(mask) > 0).astype(np.uint8) * 255
-            finally:
-                img.close()
-                mask.close()
 
-            new_rows = save_augmented_arrays(
-                img_np,
-                mask_np,
-                targets,
-                sample,
-                sample_idx,
-                copy_idx,
-                args,
-            )
-            for target_name, rows in new_rows.items():
-                rows_by_target[target_name].extend(rows)
+        elapsed = time.time() - start
+        write_manifest(tmp_root, config, cached_samples, elapsed, args)
+        output_root = finalize_output_dir(tmp_root, output_root)
+        tmp_root = None
+    except Exception:
+        if tmp_root is not None and tmp_root.exists():
+            shutil.rmtree(tmp_root)
+        raise
 
-    elapsed = time.time() - start
-    for target in targets:
-        output_root = target.output_root.expanduser().resolve()
-        manifest = {
-            "config": config,
-            "samples": rows_by_target[target.name],
-            "elapsed_seconds": elapsed,
-        }
-        (output_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
-        print(f"{target.name}: wrote {len(rows_by_target[target.name])} cached samples")
+    print(f"\nWrote {len(cached_samples)} cached samples to {output_root}")
 
-        if args.zip:
-            archive_base = output_root.parent / output_root.name
-            zip_path = shutil.make_archive(
-                str(archive_base),
-                "zip",
-                root_dir=output_root.parent,
-                base_dir=output_root.name,
-            )
-            print(f"{target.name}: created archive {zip_path}")
+    if args.zip:
+        remove_stale_zip(output_root)
+        archive_base = output_root.parent / output_root.name
+        zip_path = shutil.make_archive(
+            str(archive_base),
+            "zip",
+            root_dir=output_root.parent,
+            base_dir=output_root.name,
+        )
+        print(f"Created archive: {zip_path}")
 
     print(f"Done in {elapsed / 60:.1f} min")
+    print_notebook_settings(args)
 
 
 if __name__ == "__main__":
