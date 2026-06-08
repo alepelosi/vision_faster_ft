@@ -15,9 +15,8 @@ The notebooks are designed for Google Colab with a CUDA GPU. Local scripts are i
 |   |-- KolektorSDD2_SegformerB0_SideTuning.ipynb
 |   |-- KolektorSDD1_ResNet18_UNet_SideTuning.ipynb
 |   `-- KolektorSDD1_SegformerB0_SideTuning.ipynb
-|-- aug_cache/
-|   |-- build_ksdd2_aug_cache.py
-|   `-- build_ksdd1_aug_cache.py
+|-- build_ksdd2_aug_cache.py
+|-- build_ksdd1_aug_cache.py
 |-- build_ksdd1_cache_pool.py
 |-- requirements.txt
 `-- .gitignore
